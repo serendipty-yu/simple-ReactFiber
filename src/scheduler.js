@@ -1,5 +1,6 @@
-import {DELETION, ELEMENT_TEXT, PLACEMENT, TAG_HOST, TAG_ROOT, TAG_TEXT, UPDATE} from "./constants";
+import {DELETION, ELEMENT_TEXT, PLACEMENT, TAG_CLASS, TAG_HOST, TAG_ROOT, TAG_TEXT, UPDATE} from "./constants";
 import {setProps} from "./utils";
+import { UpdateQueue } from "./UpdateQueue";
 
 let nextUnitOfWork = null
 let workInProgressRoot = null //RootFiber应用的根
@@ -18,6 +19,11 @@ export function scheduleRoot(rootFiber) {
         if (rootFiber) {
             rootFiber.alternate = currentRoot
             workInProgressRoot = rootFiber
+        } else {
+            workInProgressRoot = {
+                ...currentRoot,
+                alternate: currentRoot
+            }
         }
 
     } else {
@@ -82,7 +88,21 @@ function beginWork(currentFiber) {
         updateHostText(currentFiber)
     } else if(currentFiber.tag === TAG_HOST) {
         updateHost(currentFiber)
+    } else if(currentFiber.tag === TAG_CLASS) {
+        updateClassComponent(currentFiber)
     }
+}
+
+function updateClassComponent(currentFiber) {
+    if(!currentFiber.stateNode) { // stateNode 组件的实例
+        currentFiber.stateNode = new currentFiber.type(currentFiber.props)
+        currentFiber.stateNode.internalFiber = currentFiber
+        currentFiber.updateQueue = new UpdateQueue()
+    }
+    currentFiber.stateNode.state = currentFiber.updateQueue.forceUpdate(currentFiber.stateNode.state)
+    let newElement = currentFiber.stateNode.render()
+    const newChildren = [newElement]
+    reconcileChildren(currentFiber,newChildren)
 }
 
 function updateHost(currentFiber) {
@@ -111,7 +131,9 @@ function createDOM(currentFiber) {
 }
 
 function updateDOM(stateNode, oldProps, newProps) {
-    setProps(stateNode, oldProps, newProps)
+    if(stateNode.setAttribute) {
+        setProps(stateNode, oldProps, newProps)
+    }
 }
 
 function updateHostRoot(currentFiber) {
@@ -125,6 +147,7 @@ function reconcileChildren(currentFiber, newChildren) {
     //console.log('newChildren',newChildren)
     let newChildIndex = 0
     let oldFiber = currentFiber.alternate && currentFiber.alternate.child
+    if(oldFiber) oldFiber.firstEffect = oldFiber.lastEffect = oldFiber.nextEffect = null
     let prevSibling
     while(newChildIndex < newChildren.length || oldFiber) {
         let newChild = newChildren[newChildIndex]
@@ -132,22 +155,35 @@ function reconcileChildren(currentFiber, newChildren) {
         const sameType = oldFiber && newChild && oldFiber.type === newChild.type
 
         let tag
-        if(newChild && newChild.type === ELEMENT_TEXT) {
+        if(newChild && typeof newChild.type === 'function'
+            && newChild.type.prototype.isReactComponent) {
+            tag = TAG_CLASS
+        } else if(newChild && newChild.type === ELEMENT_TEXT) {
             tag = TAG_TEXT
         } else if (newChild && typeof newChild.type === 'string') {
             tag = TAG_HOST
         }
 
         if(sameType) {
-            newFiber = {
-                tag: oldFiber.tag,
-                type: oldFiber.type,
-                props: newChild.props,
-                stateNode: oldFiber.stateNode, //div 还没有创建DOM元素
-                return: currentFiber, // 父fiber
-                alternate: oldFiber,
-                effectTag: UPDATE,
-                nextEffect: null  //
+            if(oldFiber.alternate) {
+                newFiber = oldFiber.alternate
+                newFiber.props = newChild.props
+                newFiber.alternate = oldFiber
+                newFiber.effectTag = UPDATE
+                newFiber.updateQueue = oldFiber.updateQueue || new UpdateQueue()
+                newFiber.nextEffect = null
+            } else {
+                newFiber = {
+                    tag: oldFiber.tag,
+                    type: oldFiber.type,
+                    props: newChild.props,
+                    stateNode: oldFiber.stateNode, //div 还没有创建DOM元素
+                    return: currentFiber, // 父fiber
+                    updateQueue: oldFiber.updateQueue || new UpdateQueue(),
+                    alternate: oldFiber,
+                    effectTag: UPDATE,
+                    nextEffect: null  //
+                }
             }
         } else {
             if(newChild) {
@@ -158,6 +194,7 @@ function reconcileChildren(currentFiber, newChildren) {
                     stateNode: null, //div 还没有创建DOM元素
                     return: currentFiber, // 父fiber
                     effectTag: PLACEMENT,
+                    updateQueue: new UpdateQueue(),
                     nextEffect: null  //effect list 单链表
                 }
             }
@@ -211,21 +248,47 @@ function commitRoot() {
 function commitWork(currentFiber) {
     if (!currentFiber) return;
     let returnFiber = currentFiber.return;
+
+    while(returnFiber.tag !== TAG_HOST
+        && returnFiber.tag !== TAG_TEXT
+        && returnFiber.tag !== TAG_ROOT
+        ) {
+        returnFiber = returnFiber.return
+    }
+
     let domReturn = returnFiber.stateNode;
     if (currentFiber.effectTag === PLACEMENT) {
-        domReturn.appendChild(currentFiber.stateNode)
+        let nextFiber = currentFiber
+
+        while(nextFiber.tag !== TAG_HOST && nextFiber.tag !== TAG_TEXT) {
+            nextFiber = currentFiber.child
+        }
+
+        domReturn.appendChild(nextFiber.stateNode)
     } else if(currentFiber.effectTag === DELETION) {
-        domReturn.removeChild(currentFiber.stateNode)
+        //domReturn.removeChild(currentFiber.stateNode)
+        return commitDeletion(currentFiber,domReturn)
     }else if(currentFiber.effectTag === UPDATE) {
         if(currentFiber.type === ELEMENT_TEXT) {
             if(currentFiber.alternate.props.text !== currentFiber.props.text) {
                 currentFiber.stateNode.textContent = currentFiber.props.text
             }
         } else {
+            if(currentFiber.type === TAG_CLASS) {
+                return currentFiber.effectTag = null
+            }
             updateDOM(currentFiber.stateNode,currentFiber.alternate.props,currentFiber.props)
         }
     }
     currentFiber.effectTag = null;
+}
+
+function commitDeletion(currentFiber, domReturn) {
+    if(currentFiber.tag !== TAG_HOST  || currentFiber.tag !== TAG_TEXT) {
+        domReturn.removeChild(currentFiber.stateNode)
+    } else {
+        commitDeletion(currentFiber.child,domReturn)
+    }
 }
 
 requestIdleCallback(workLoop, { timeout: 5000 })

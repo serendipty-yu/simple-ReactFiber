@@ -1,5 +1,5 @@
 import {TAG_ROOT} from "./constants";
-import {scheduleRoot} from "./schedule";
+import {scheduleRoot} from "./scheduler";
 
 
 function render(element, container) {
